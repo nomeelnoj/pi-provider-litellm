@@ -23,7 +23,9 @@
 - Prefer `/model/info` for rich metadata; fallback to `/v1/models` only on 401, 403, or 404.
 - The `/v1/models` fallback enriches metadata from the Pi catalog and `https://models.dev/api.json`; keep fallback metadata tests current.
 - Keep `LITELLM_OFFLINE` and `LITELLM_DISCOVERY_TIMEOUT_MS` behavior compatible with README docs.
-- Stored Pi `/login litellm` credentials take precedence over `LITELLM_API_KEY`.
+- Credential precedence is `models.json` (`providers.litellm`) → `settings.json` (`providers.litellm` or top-level `litellm`) → `auth.json` (`/login litellm`) → Google ADC → `LITELLM_API_KEY_HELPER` → `LITELLM_API_KEY`; base URL resolves in the same order.
+- `models.json`/`settings.json` are read raw from the Pi agent dir (their typed schemas do not surface this plugin's keys). The `providers.litellm` block is plugin-managed: only `baseUrl`/`apiKey` are needed, no `api`/`models[]` (the extension injects discovered models).
+- `apiKey` resolution mirrors Pi's `models.json` value semantics (literal, `$ENV`/`${ENV}` with in-string interpolation, `$$`/`$!` escapes, `!command`); `resolveConfigTemplate()` reimplements this rather than deep-importing Pi internals. The raw config string is handed to `registerProvider` for per-request re-resolution.
 - Cache data is stored as `litellm-models.json` under the Pi agent dir with a keyed API-key fingerprint and a 24-hour stale refresh window.
 
 ## LiteLLM Request Hooks

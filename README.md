@@ -32,7 +32,36 @@ npm run clean && npm run build
 
 ## Configure
 
-### Option A — interactive login
+Credentials are resolved in this order: **`models.json`** → `settings.json` → `/login litellm` (`auth.json`) → Google ADC → `LITELLM_API_KEY_HELPER` → `LITELLM_API_KEY`. Base URL resolves in the same order. A `providers.litellm` block with both `baseUrl` and `apiKey` makes `auth.json` and the environment variables effectively unused.
+
+### Option A — models.json (recommended)
+
+This plugin makes `litellm` a first-class provider block in Pi's native custom-model config at `~/.pi/agent/models.json` — the same file where you define your other providers. Add a `providers.litellm` block with just `baseUrl` and `apiKey`:
+
+```json
+{
+  "providers": {
+    "litellm": {
+      "baseUrl": "https://litellm.your-domain.com",
+      "apiKey": "$LITELLM_API_KEY"
+    }
+  }
+}
+```
+
+The block is plugin-managed: you do **not** add `api` or a `models[]` array. The extension supplies `api: "openai-completions"` and injects the models it discovers from the proxy. (A bare `providers.litellm` block on its own contributes no models to Pi natively, because `litellm` is not a built-in provider — the discovery the extension performs is what populates `/model`.)
+
+The `baseUrl` may include or omit a trailing `/v1`; both resolve to the same endpoint.
+
+The `apiKey` value uses the same value-resolution syntax as the rest of `models.json`:
+
+- **Literal** — `"sk-..."` is used as-is.
+- **Environment reference** — `"$LITELLM_API_KEY"` or `"${LITELLM_API_KEY}"`, including interpolation inside a larger string (`"prefix-${KEY}-suffix"`). The raw reference is handed to Pi, so it re-resolves on every request. Use `$$` / `$!` for literal `$` / `!`.
+- **Command** — `"!some-command"` runs the command and uses its stdout as the token. Pi re-runs it on every request, so rotating/short-lived tokens stay fresh.
+
+> `settings.json` is also accepted as a fallback (same `providers.litellm` shape, plus a top-level `litellm` alias), but `models.json` is the recommended home.
+
+### Option B — interactive login
 
 Inside pi:
 
@@ -42,7 +71,7 @@ Inside pi:
 
 You can also run `/login`, select `Use a subscription`, then select `LiteLLM`.
 
-You'll be prompted for the base URL and API key. Credentials are persisted to `~/.pi/agent/auth.json`.
+You'll be prompted for the base URL and API key. Credentials are persisted to `~/.pi/agent/auth.json`. A `models.json` (or `settings.json`) `providers.litellm` block (Option A) takes precedence over these stored credentials when present.
 
 #### Enterprise SSO login
 
@@ -59,14 +88,14 @@ When you generate a virtual key, the resulting `sk-...` key is stored as your cr
 
 When using a JWT directly, the extension reads its `exp` claim and Pi will prompt you to re-authenticate when the token nears expiry. Run `/login litellm` again to refresh.
 
-### Option B — environment variables
+### Option C — environment variables
 
 ```bash
 export LITELLM_BASE_URL="https://litellm.your-domain.com"
 export LITELLM_API_KEY="sk-..."
 ```
 
-Stored pi credentials for `litellm` take precedence over `LITELLM_API_KEY`; the environment key is used when no saved credential exists. `LITELLM_BASE_URL` is used when no saved login base URL exists.
+A `providers.litellm` block (in `models.json` or `settings.json`) and stored pi credentials for `litellm` both take precedence over `LITELLM_API_KEY`; the environment key is used when neither exists. `LITELLM_BASE_URL` is used when no configured base URL or saved login base URL exists.
 
 ## Use
 
