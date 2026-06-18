@@ -13,6 +13,7 @@ const ENV_KEYS = [
   "LITELLM_GCLOUD_TOKEN_AUTH",
   "GOOGLE_APPLICATION_CREDENTIALS",
   "STORED_LITELLM_KEY",
+  "SETTINGS_LITELLM_KEY",
 ];
 const ORIGINAL_ENV = new Map(ENV_KEYS.map((key) => [key, process.env[key]]));
 
@@ -329,6 +330,139 @@ describe("extension startup", () => {
     await extension(createPi());
 
     expect(seenAuthHeaders).toEqual(["Bearer stored-key", "Bearer stored-key"]);
+  });
+
+  async function writeModelsProvider(agentDir: string, litellm: Record<string, unknown>): Promise<void> {
+    await writeFile(join(agentDir, "models.json"), JSON.stringify({ providers: { litellm } }), "utf8");
+  }
+
+  it("resolves base URL and env-ref API key from models.json providers.litellm", async () => {
+    const agentDir = await makeAgentDir();
+    await writeModelsProvider(agentDir, { baseUrl: "https://settings.example.com", apiKey: "$SETTINGS_LITELLM_KEY" });
+    process.env.SETTINGS_LITELLM_KEY = "settings-key";
+    const seenAuthHeaders: string[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      seenAuthHeaders.push(new Headers(init?.headers).get("authorization") ?? "");
+      return jsonResponse(200, {
+        data: [{ model_name: "openai/gpt-4o", model_info: { mode: "chat" } }],
+      });
+    });
+
+    const extension = await loadExtension(agentDir);
+    const pi = createPi();
+    await extension(pi);
+
+    expect(seenAuthHeaders).toEqual(["Bearer settings-key", "Bearer settings-key"]);
+    expect(pi.providers[0]?.config.baseUrl).toBe("https://settings.example.com/v1");
+    // The raw env reference is handed back to Pi so it re-resolves per request.
+    expect(pi.providers[0]?.config.apiKey).toBe("$SETTINGS_LITELLM_KEY");
+    // A providers.litellm block with no models[] still yields extension-discovered models.
+    expect(pi.providers[0]?.config.models).toHaveLength(1);
+  });
+
+  it("normalizes a models.json base URL that already ends in /v1", async () => {
+    const agentDir = await makeAgentDir();
+    await writeModelsProvider(agentDir, { baseUrl: "https://settings.example.com/v1", apiKey: "sk-literal" });
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+      jsonResponse(200, { data: [{ model_name: "openai/gpt-4o", model_info: { mode: "chat" } }] }),
+    );
+
+    const extension = await loadExtension(agentDir);
+    const pi = createPi();
+    await extension(pi);
+
+    expect(pi.providers[0]?.config.baseUrl).toBe("https://settings.example.com/v1");
+  });
+
+  it("resolves a models.json API key with interpolation inside a literal", async () => {
+    const agentDir = await makeAgentDir();
+    // Built via concatenation so the literal never contains a JS-looking `${...}` token.
+    const interpolatedKey = `prefix-$${"{SETTINGS_LITELLM_KEY}"}-suffix`;
+    await writeModelsProvider(agentDir, { baseUrl: "https://settings.example.com", apiKey: interpolatedKey });
+    process.env.SETTINGS_LITELLM_KEY = "middle";
+    const seenAuthHeaders: string[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      seenAuthHeaders.push(new Headers(init?.headers).get("authorization") ?? "");
+      return jsonResponse(200, { data: [{ model_name: "openai/gpt-4o", model_info: { mode: "chat" } }] });
+    });
+
+    const extension = await loadExtension(agentDir);
+    const pi = createPi();
+    await extension(pi);
+
+    expect(seenAuthHeaders).toEqual(["Bearer prefix-middle-suffix", "Bearer prefix-middle-suffix"]);
+    expect(pi.providers[0]?.config.apiKey).toBe(interpolatedKey);
+  });
+
+  it("prefers models.json over settings.json, auth.json, and env vars", async () => {
+    const agentDir = await makeAgentDir();
+    await writeModelsProvider(agentDir, { baseUrl: "https://settings.example.com", apiKey: "$SETTINGS_LITELLM_KEY" });
+    await writeFile(
+      join(agentDir, "settings.json"),
+      JSON.stringify({ providers: { litellm: { baseUrl: "https://ignored.example.com", apiKey: "sk-ignored" } } }),
+      "utf8",
+    );
+    await writeFile(
+      join(agentDir, "auth.json"),
+      JSON.stringify({ litellm: { type: "oauth", access: "auth-key", refresh: "", expires: 9007199254740991 } }),
+      "utf8",
+    );
+    process.env.LITELLM_BASE_URL = "https://env.example.com";
+    process.env.LITELLM_API_KEY = "env-key";
+    process.env.SETTINGS_LITELLM_KEY = "settings-key";
+    const seenAuthHeaders: string[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      seenAuthHeaders.push(new Headers(init?.headers).get("authorization") ?? "");
+      return jsonResponse(200, { data: [{ model_name: "openai/gpt-4o", model_info: { mode: "chat" } }] });
+    });
+
+    const extension = await loadExtension(agentDir);
+    const pi = createPi();
+    await extension(pi);
+
+    expect(seenAuthHeaders).toEqual(["Bearer settings-key", "Bearer settings-key"]);
+    expect(pi.providers[0]?.config.baseUrl).toBe("https://settings.example.com/v1");
+    expect(pi.providers[0]?.config.apiKey).toBe("$SETTINGS_LITELLM_KEY");
+  });
+
+  it("falls back to a settings.json block when models.json has no litellm provider", async () => {
+    const agentDir = await makeAgentDir();
+    await writeFile(
+      join(agentDir, "settings.json"),
+      JSON.stringify({ litellm: { baseUrl: "https://settings.example.com", apiKey: "sk-literal" } }),
+      "utf8",
+    );
+    const seenAuthHeaders: string[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      seenAuthHeaders.push(new Headers(init?.headers).get("authorization") ?? "");
+      return jsonResponse(200, { data: [{ model_name: "openai/gpt-4o", model_info: { mode: "chat" } }] });
+    });
+
+    const extension = await loadExtension(agentDir);
+    const pi = createPi();
+    await extension(pi);
+
+    expect(seenAuthHeaders).toEqual(["Bearer sk-literal", "Bearer sk-literal"]);
+    expect(pi.providers[0]?.config.apiKey).toBe("sk-literal");
+  });
+
+  it("registers a models.json !command API key as a re-resolved provider command", async () => {
+    const agentDir = await makeAgentDir();
+    const helperPath = await writeHelper(agentDir, ["command-key"]);
+    await writeModelsProvider(agentDir, { baseUrl: "https://settings.example.com", apiKey: `!${helperPath}` });
+    const seenAuthHeaders: string[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      seenAuthHeaders.push(new Headers(init?.headers).get("authorization") ?? "");
+      return jsonResponse(200, { data: [{ model_name: "openai/gpt-4o", model_info: { mode: "chat" } }] });
+    });
+
+    const extension = await loadExtension(agentDir);
+    const pi = createPi();
+    await extension(pi);
+
+    expect(seenAuthHeaders).toEqual(["Bearer command-key", "Bearer command-key"]);
+    // The raw !command is registered so Pi re-runs it on every request.
+    expect(pi.providers[0]?.config.apiKey).toBe(`!${helperPath}`);
   });
 
   it("does not fetch on refresh when discovery timeout is zero", async () => {
