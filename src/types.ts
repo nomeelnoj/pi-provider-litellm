@@ -62,6 +62,11 @@ export type AuthFileEntry =
   | { type: "oauth"; access: string; refresh: string; expires: number; baseUrl?: string }
   | { type: "api_key"; key: string };
 
+export interface ConfiguredProviderEntry {
+  baseUrl?: string;
+  apiKey?: string;
+}
+
 export interface ResolvedCredentials {
   baseUrl?: string;
   apiKey?: string;

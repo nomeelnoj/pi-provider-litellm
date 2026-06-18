@@ -16,7 +16,14 @@ import {
 import { getSessionIdFromFile } from "./litellm.js";
 import { createMcpToolDefinitions } from "./mcp-tools.js";
 import { createSkillsPromptSection, createSkillToolDefinitions, listSkills } from "./skills.js";
-import type { AuthFileEntry, CacheFile, DiscoveryOptions, DiscoveryResult, ResolvedCredentials } from "./types.js";
+import type {
+  AuthFileEntry,
+  CacheFile,
+  ConfiguredProviderEntry,
+  DiscoveryOptions,
+  DiscoveryResult,
+  ResolvedCredentials,
+} from "./types.js";
 
 const PROVIDER_NAME = "litellm";
 const ENV_BASE_URL = "LITELLM_BASE_URL";
@@ -27,6 +34,8 @@ const ENV_OFFLINE = "LITELLM_OFFLINE";
 const DEFAULT_TIMEOUT_MS = 5000;
 const LOGIN_TIMEOUT_MS = 10_000;
 const CACHE_FILENAME = "litellm-models.json";
+const MODELS_FILENAME = "models.json";
+const SETTINGS_FILENAME = "settings.json";
 const CACHE_STALE_MS = 24 * 60 * 60 * 1000;
 const TOKEN_REFRESH_LEAD_MS = 5 * 60 * 1000;
 const PERMANENT_TOKEN_EXPIRES_AT = Number.MAX_SAFE_INTEGER;
@@ -42,6 +51,14 @@ function getCachePath(): string {
   return join(getAgentDir(), CACHE_FILENAME);
 }
 
+function getModelsPath(): string {
+  return join(getAgentDir(), MODELS_FILENAME);
+}
+
+function getSettingsPath(): string {
+  return join(getAgentDir(), SETTINGS_FILENAME);
+}
+
 async function readAuthEntry(): Promise<AuthFileEntry | undefined> {
   try {
     const raw = await readFile(getAuthPath(), "utf8");
@@ -50,6 +67,122 @@ async function readAuthEntry(): Promise<AuthFileEntry | undefined> {
   } catch {
     return undefined;
   }
+}
+
+// Reads a LiteLLM provider config block from a Pi config file (models.json or
+// settings.json). Supports the `providers.litellm` shape and, when allowed, a
+// top-level `litellm` convenience alias. These files are read raw (mirroring how
+// auth.json is read) because their typed schemas do not surface this plugin's keys.
+async function readProviderEntryFromFile(
+  path: string,
+  { allowTopLevelAlias = false }: { allowTopLevelAlias?: boolean } = {},
+): Promise<ConfiguredProviderEntry | undefined> {
+  try {
+    const parsed = JSON.parse(await readFile(path, "utf8")) as {
+      providers?: Record<string, unknown>;
+      [key: string]: unknown;
+    };
+    const entry = parsed?.providers?.[PROVIDER_NAME] ?? (allowTopLevelAlias ? parsed?.[PROVIDER_NAME] : undefined);
+    if (!entry || typeof entry !== "object") return undefined;
+    const { baseUrl: rawBaseUrl, apiKey: rawApiKey } = entry as Record<string, unknown>;
+    const baseUrl = typeof rawBaseUrl === "string" ? cleanConfig(rawBaseUrl) : undefined;
+    const apiKey = typeof rawApiKey === "string" ? cleanConfig(rawApiKey) : undefined;
+    return baseUrl || apiKey ? { baseUrl, apiKey } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// Pi's native `models.json` is the first-class home for provider config; settings.json
+// is supported as a secondary fallback so a single block works in either file.
+async function readModelsEntry(): Promise<ConfiguredProviderEntry | undefined> {
+  return readProviderEntryFromFile(getModelsPath());
+}
+
+async function readSettingsEntry(): Promise<ConfiguredProviderEntry | undefined> {
+  return readProviderEntryFromFile(getSettingsPath(), { allowTopLevelAlias: true });
+}
+
+const LEGACY_ENV_VAR_NAME_RE = /^[A-Z_][A-Z0-9_]*$/;
+
+// Resolves a Pi config-value template (literal text with $ENV / ${ENV} interpolation
+// and $$ / $! escapes) to its concrete value, matching Pi's resolveConfigValue
+// semantics. Returns undefined if any referenced env var is missing. This is a faithful
+// reimplementation rather than a deep import of Pi internals (not public API).
+function resolveConfigTemplate(config: string): string | undefined {
+  let resolved = "";
+  let index = 0;
+  while (index < config.length) {
+    const dollar = config.indexOf("$", index);
+    if (dollar < 0) {
+      resolved += config.slice(index);
+      break;
+    }
+    resolved += config.slice(index, dollar);
+    const next = config[dollar + 1];
+    if (next === "$" || next === "!") {
+      resolved += next;
+      index = dollar + 2;
+      continue;
+    }
+    if (next === "{") {
+      const end = config.indexOf("}", dollar + 2);
+      if (end < 0) {
+        resolved += "$";
+        index = dollar + 1;
+        continue;
+      }
+      const name = config.slice(dollar + 2, end);
+      if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+        const value = process.env[name];
+        if (!value) return undefined;
+        resolved += value;
+      } else {
+        resolved += config.slice(dollar, end + 1);
+      }
+      index = end + 1;
+      continue;
+    }
+    const match = config.slice(dollar + 1).match(/^[A-Za-z_][A-Za-z0-9_]*/);
+    if (match) {
+      const value = process.env[match[0]];
+      if (!value) return undefined;
+      resolved += value;
+      index = dollar + 1 + match[0].length;
+      continue;
+    }
+    resolved += "$";
+    index = dollar + 1;
+  }
+  return resolved;
+}
+
+// Resolves a Pi-style apiKey config value (literal, $ENV/${ENV} interpolation, or
+// !command) into the actual key (for discovery/fingerprint) plus the raw config string
+// to hand back to registerProvider so Pi re-resolves $VAR/!command per request.
+function resolveConfiguredApiKey(
+  raw: string | undefined,
+  executeHelpers: boolean,
+): { apiKey?: string; apiKeyFingerprint?: string; apiKeyConfig?: string } {
+  const apiKeyConfig = cleanConfig(raw);
+  if (!apiKeyConfig) return {};
+
+  if (apiKeyConfig.startsWith("!")) {
+    return {
+      apiKey: executeHelpers ? executeApiKeyCommand(apiKeyConfig).trim() : undefined,
+      apiKeyFingerprint: fingerprint(apiKeyConfig),
+      apiKeyConfig,
+    };
+  }
+
+  // Pi migrates legacy bare uppercase names (e.g. ANTHROPIC_AUTH_TOKEN) to $-refs.
+  const template = LEGACY_ENV_VAR_NAME_RE.test(apiKeyConfig) ? `$${apiKeyConfig}` : apiKeyConfig;
+  const apiKey = cleanConfig(resolveConfigTemplate(template));
+  return {
+    apiKey,
+    apiKeyFingerprint: apiKey ? fingerprint(apiKey) : undefined,
+    apiKeyConfig,
+  };
 }
 
 function cleanConfig(raw: string | undefined): string | undefined {
@@ -142,6 +275,15 @@ function resolveOAuthApiKey(credentials: OAuthCredentials): string {
 }
 
 async function resolveCredentials({ executeHelpers = true } = {}): Promise<ResolvedCredentials> {
+  // models.json is Pi's first-class provider-config home; settings.json is a fallback.
+  const modelsEntry: ConfiguredProviderEntry | undefined = await readModelsEntry();
+  const settingsEntry: ConfiguredProviderEntry | undefined = await readSettingsEntry();
+  const configEntry: ConfiguredProviderEntry = {
+    baseUrl: modelsEntry?.baseUrl ?? settingsEntry?.baseUrl,
+    apiKey: modelsEntry?.apiKey ?? settingsEntry?.apiKey,
+  };
+  const configKey = resolveConfiguredApiKey(configEntry.apiKey, executeHelpers);
+  const configBase = configEntry.baseUrl?.trim();
   const entry = await readAuthEntry();
   const envBase = cleanConfig(process.env[ENV_BASE_URL]);
   const envKey = cleanConfig(process.env[ENV_API_KEY]);
@@ -158,11 +300,16 @@ async function resolveCredentials({ executeHelpers = true } = {}): Promise<Resol
   const gcloudKey = executeHelpers && gcloudCacheKey ? (await getGcloudToken())?.trim() : undefined;
   const helperKey =
     !authKey && !gcloudKey && executeHelpers && envHelperCommand ? executeApiKeyCommand(envHelperCommand) : undefined;
-  const apiKey = authKey || gcloudKey || helperKey || envKey;
+  const apiKey = configKey.apiKey || authKey || gcloudKey || helperKey || envKey;
 
   let apiKeyFingerprint: string | undefined;
   let apiKeyConfig: string | undefined;
-  if (entry?.type === "oauth" && entry.refresh.startsWith("!")) {
+  if (configKey.apiKeyConfig) {
+    // models.json/settings.json take precedence: a configured apiKey makes
+    // auth.json and the LITELLM_API_KEY env vars effectively ignored.
+    apiKeyFingerprint = configKey.apiKeyFingerprint;
+    apiKeyConfig = configKey.apiKeyConfig;
+  } else if (entry?.type === "oauth" && entry.refresh.startsWith("!")) {
     apiKeyFingerprint = fingerprint(entry.refresh);
   } else if (authKey) {
     apiKeyFingerprint = fingerprint(authKey);
@@ -182,7 +329,7 @@ async function resolveCredentials({ executeHelpers = true } = {}): Promise<Resol
     apiKeyFingerprint = fingerprint(envKey);
     apiKeyConfig = `$${ENV_API_KEY}`;
   }
-  const rawBase = authBase || envBase;
+  const rawBase = configBase || authBase || envBase;
   return {
     baseUrl: rawBase ? normalizeBaseUrl(rawBase) : undefined,
     apiKey: apiKey || undefined,
