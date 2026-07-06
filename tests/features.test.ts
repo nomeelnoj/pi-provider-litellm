@@ -322,6 +322,13 @@ describe("feature parity", () => {
       thinking: { type: "disabled" },
       litellm_session_id: "123e4567-e89b-12d3-a456-426614174000",
     });
+
+    // Anthropic Messages payloads must not carry the OpenAI-only litellm_session_id field.
+    const anthropicUpdated = beforeRequest?.(
+      { payload: { messages: [] } },
+      { model: { provider: "litellm", id: "claude-opus-4-8", api: "anthropic-messages" } },
+    );
+    expect(anthropicUpdated).toBeUndefined();
   });
 
   it("suppresses separate Kimi reasoning streams before session ids are available", async () => {

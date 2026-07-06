@@ -476,15 +476,23 @@ async function refreshLiteLLM(credentials: OAuthCredentials): Promise<OAuthCrede
   return { ...credentials, access, expires: tokenExpiresAt(access, EXPIRE_TOKEN_IMMEDIATELY) };
 }
 
+// Anthropic-messages models hit LiteLLM's native `/v1/messages` route (pi's Anthropic SDK
+// appends `/v1/messages` to the model baseUrl), so they anchor at the LiteLLM root. Every
+// other model uses the OpenAI-compatible `/v1` base.
+function litellmModelBaseUrl(baseUrl: string, api: Api | undefined): string {
+  return api === "anthropic-messages" ? baseUrl : `${baseUrl}/v1`;
+}
+
 function modifyLiteLLMModels(models: Model<Api>[], cred: OAuthCredentials): Model<Api>[] {
   const baseUrl = (cred as { baseUrl?: string }).baseUrl;
   if (!baseUrl) return models;
-  return models.map((m) => (m.provider === PROVIDER_NAME ? { ...m, baseUrl: `${baseUrl}/v1` } : m));
+  return models.map((m) => (m.provider === PROVIDER_NAME ? { ...m, baseUrl: litellmModelBaseUrl(baseUrl, m.api) } : m));
 }
 
 function prepareLiteLLMRequestPayload(
   payload: Record<string, unknown>,
   modelId: string | undefined,
+  modelApi: Api | undefined,
   sessionId: string | undefined,
 ): Record<string, unknown> | undefined {
   let next: Record<string, unknown> | undefined;
@@ -501,7 +509,9 @@ function prepareLiteLLMRequestPayload(
     update("thinking", { type: "disabled" });
   }
 
-  if (sessionId) {
+  // litellm_session_id is an OpenAI-completions grouping hint; the Anthropic Messages
+  // endpoint rejects unknown top-level fields, so never inject it into those payloads.
+  if (sessionId && modelApi !== "anthropic-messages") {
     next ??= { ...payload };
     next.litellm_session_id = sessionId;
   }
@@ -657,6 +667,12 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     models: ProviderModelConfig[],
     apiKeyConfig = creds.apiKeyConfig ?? getApiKeyHelperCommand() ?? `$${ENV_API_KEY}`,
   ): void {
+    // Anthropic-backed models carry `api: "anthropic-messages"` from discovery; pin them to
+    // the LiteLLM root so pi's Anthropic SDK targets `/v1/messages`. The rest inherit the
+    // provider-level `openai-completions` API and `/v1` base.
+    const preparedModels = baseUrl
+      ? models.map((m) => (m.api === "anthropic-messages" ? { ...m, baseUrl } : m))
+      : models;
     pi.registerProvider(PROVIDER_NAME, {
       baseUrl: baseUrl ? `${baseUrl}/v1` : "https://litellm.example.com/v1",
       // When LITELLM_API_KEY_HELPER is set we register the helper as a `!command` provider key.
@@ -668,7 +684,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       // "re-runs the helper command on every request" in tests/index.test.ts.
       apiKey: apiKeyConfig,
       api: "openai-completions",
-      models,
+      models: preparedModels,
       oauth,
     });
   }
@@ -834,7 +850,12 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   pi.on("before_provider_request", (event, ctx) => {
     if (ctx.model?.provider !== PROVIDER_NAME) return;
     if (typeof event.payload !== "object" || event.payload === null) return;
-    return prepareLiteLLMRequestPayload(event.payload as Record<string, unknown>, ctx.model?.id, sessionId);
+    return prepareLiteLLMRequestPayload(
+      event.payload as Record<string, unknown>,
+      ctx.model?.id,
+      ctx.model?.api,
+      sessionId,
+    );
   });
 
   pi.on("before_agent_start", async (event) => {

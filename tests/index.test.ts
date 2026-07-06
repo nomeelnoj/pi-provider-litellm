@@ -22,6 +22,7 @@ vi.unmock("@earendil-works/pi-coding-agent");
 type TestProviderConfig = {
   baseUrl?: string;
   apiKey?: string;
+  api?: string;
   models?: unknown[];
   oauth?: {
     login: (callbacks: {
@@ -215,6 +216,46 @@ describe("extension startup", () => {
     await extension(pi);
 
     expect(pi.providers[0]?.config.apiKey).toBe("$LITELLM_API_KEY");
+  });
+
+  it("routes Anthropic-backed discovered models to anthropic-messages at the LiteLLM root", async () => {
+    const agentDir = await makeAgentDir();
+    process.env.LITELLM_BASE_URL = "https://litellm.example.com";
+    process.env.LITELLM_API_KEY = "env-key";
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.endsWith("/model/info")) {
+        return jsonResponse(200, {
+          data: [
+            { model_name: "claude-opus-4-8", model_info: { mode: "chat", supports_reasoning: true } },
+            { model_name: "openai/gpt-4o", model_info: { mode: "chat" } },
+          ],
+        });
+      }
+      if (url.includes("/mcp-rest/tools/list")) return jsonResponse(200, { tools: [] });
+      return jsonResponse(200, {});
+    });
+
+    const extension = await loadExtension(agentDir);
+    const pi = createPi();
+    await extension(pi);
+
+    const config = pi.providers[0]?.config;
+    // Provider default remains OpenAI-completions; the base carries the /v1 suffix.
+    expect(config?.api).toBe("openai-completions");
+    expect(config?.baseUrl).toBe("https://litellm.example.com/v1");
+
+    const models = (config?.models ?? []) as Array<{ id: string; api?: string; baseUrl?: string; compat?: unknown }>;
+    const opus = models.find((m) => m.id === "claude-opus-4-8");
+    // Anthropic-messages models anchor at the LiteLLM root (pi's Anthropic SDK appends /v1/messages).
+    expect(opus?.api).toBe("anthropic-messages");
+    expect(opus?.baseUrl).toBe("https://litellm.example.com");
+    expect(opus?.compat).toEqual({ forceAdaptiveThinking: true });
+
+    const gpt = models.find((m) => m.id === "openai/gpt-4o");
+    // Non-Anthropic models inherit the provider defaults (no per-model api or baseUrl).
+    expect(gpt?.api).toBeUndefined();
+    expect(gpt?.baseUrl).toBeUndefined();
   });
 
   it("registers the env key when gcloud ADC auth falls back during discovery", async () => {

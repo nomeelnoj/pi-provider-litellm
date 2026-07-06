@@ -1,5 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { buildCompat, discoverModels, normalizeBaseUrl, shouldSuppressReasoningContent } from "../src/discover.js";
+import {
+  buildCompat,
+  buildDiscoveredCompat,
+  discoverModels,
+  isAnthropicModel,
+  normalizeBaseUrl,
+  resolveModelApi,
+  shouldSuppressReasoningContent,
+  supportsAdaptiveThinking,
+} from "../src/discover.js";
 
 function jsonResponse(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -101,6 +110,66 @@ describe("buildCompat", () => {
   });
 });
 
+describe("isAnthropicModel", () => {
+  it("matches Claude family ids and anthropic-prefixed routes", () => {
+    for (const id of ["anthropic/claude-3-5-sonnet", "claude-opus-4-8", "opus-4.7", "google/claude-sonnet-4-6"]) {
+      expect(isAnthropicModel(id)).toBe(true);
+    }
+  });
+
+  it("matches on owned_by even when the id is opaque", () => {
+    expect(isAnthropicModel("prod-reasoning-model", "anthropic")).toBe(true);
+    expect(isAnthropicModel("prod-reasoning-model", "openai")).toBe(false);
+  });
+
+  it("does not match unrelated ids", () => {
+    expect(isAnthropicModel("openai/gpt-4o")).toBe(false);
+    expect(isAnthropicModel("vendor/opusflow")).toBe(false);
+  });
+});
+
+describe("supportsAdaptiveThinking", () => {
+  it("flags Opus 4.6+/Sonnet 4.6/Fable 5 regardless of separator or prefix", () => {
+    for (const id of ["claude-opus-4-8", "opus-4.8", "anthropic/claude-opus-4-6", "sonnet-4.6", "fable-5"]) {
+      expect(supportsAdaptiveThinking(id)).toBe(true);
+    }
+  });
+
+  it("does not flag older Claude models", () => {
+    for (const id of ["claude-3-5-sonnet", "opus-4.7-preview", "haiku-4.5"]) {
+      // opus-4.7 is adaptive; ensure only the intended families flip on.
+      if (id.includes("4-7") || id.includes("4.7")) continue;
+      expect(supportsAdaptiveThinking(id)).toBe(false);
+    }
+  });
+});
+
+describe("resolveModelApi", () => {
+  it("routes Anthropic-backed models to anthropic-messages", () => {
+    expect(resolveModelApi("claude-opus-4-8")).toBe("anthropic-messages");
+    expect(resolveModelApi("some-model", "anthropic")).toBe("anthropic-messages");
+  });
+
+  it("leaves non-Anthropic models on the provider default", () => {
+    expect(resolveModelApi("openai/gpt-4o")).toBeUndefined();
+  });
+});
+
+describe("buildDiscoveredCompat", () => {
+  it("emits forceAdaptiveThinking for adaptive Claude models", () => {
+    expect(buildDiscoveredCompat("claude-opus-4-8")).toEqual({ forceAdaptiveThinking: true });
+  });
+
+  it("emits empty anthropic compat for non-adaptive Claude models", () => {
+    expect(buildDiscoveredCompat("anthropic/claude-3-5-sonnet")).toEqual({});
+  });
+
+  it("falls back to OpenAI-completions compat for non-Anthropic models", () => {
+    expect(buildDiscoveredCompat("openai/gpt-4o")).toEqual({ supportsStore: false });
+    expect(buildDiscoveredCompat("moonshotai/kimi-k2")).toEqual(buildCompat("moonshotai/kimi-k2"));
+  });
+});
+
 describe("shouldSuppressReasoningContent", () => {
   it("suppresses separate reasoning streams for Kimi/Moonshot aliases", () => {
     expect(shouldSuppressReasoningContent("kimi-k2.6")).toBe(true);
@@ -165,11 +234,13 @@ describe("discoverModels via /model/info", () => {
     expect(anthropic).toMatchObject({
       id: "anthropic/claude-3-5-sonnet",
       name: "anthropic/claude-3-5-sonnet",
+      api: "anthropic-messages",
       contextWindow: 200000,
       maxTokens: 8192,
       input: ["text", "image"],
-      compat: { supportsStore: false, cacheControlFormat: "anthropic" },
     });
+    // Non-adaptive Claude models route to anthropic-messages with empty (default) compat.
+    expect(anthropic?.compat).toEqual({});
     // cost is per-token in LiteLLM, per-million-tokens in pi-ai
     expect(anthropic?.cost).toEqual({ input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 });
 
@@ -179,6 +250,8 @@ describe("discoverModels via /model/info", () => {
       input: ["text"],
       compat: { supportsStore: false },
     });
+    // Non-Anthropic models inherit the provider-level openai-completions API (api left unset).
+    expect(openai?.api).toBeUndefined();
   });
 
   it("uses catalog costs when /model/info omits costs for Anthropic aliases", async () => {
@@ -196,6 +269,9 @@ describe("discoverModels via /model/info", () => {
 
     expect(result.source).toBe("model_info");
     expect(result.models[0]?.cost).toEqual({ input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 });
+    // Opus 4.8 requires adaptive thinking; route it to anthropic-messages with forceAdaptiveThinking.
+    expect(result.models[0]?.api).toBe("anthropic-messages");
+    expect(result.models[0]?.compat).toEqual({ forceAdaptiveThinking: true });
   });
 });
 
@@ -217,7 +293,8 @@ describe("discoverModels fallback to /v1/models", () => {
       expect(result.models.map((m) => m.id).sort()).toEqual(["anthropic/claude-3-5-sonnet", "openai/gpt-4o"]);
       const anthropic = result.models.find((m) => m.id === "anthropic/claude-3-5-sonnet")!;
       expect(anthropic.name).toBe("anthropic/claude-3-5-sonnet (no metadata)");
-      expect(anthropic.compat).toEqual({ supportsStore: false, cacheControlFormat: "anthropic" });
+      expect(anthropic.api).toBe("anthropic-messages");
+      expect(anthropic.compat).toEqual({});
     });
   }
 
@@ -366,10 +443,11 @@ describe("discoverModels fallback to /health", () => {
     expect(result.source).toBe("health");
     expect(result.models.map((model) => model.id)).toEqual(["vertex/claude-sonnet", "openai/gpt-4o-mini"]);
     expect(result.models[0]).toMatchObject({
+      api: "anthropic-messages",
       input: ["text", "image"],
       contextWindow: 200000,
-      compat: { supportsStore: false, cacheControlFormat: "anthropic" },
     });
+    expect(result.models[0]?.compat).toEqual({});
   });
 
   it("uses healthy endpoint model names when /health entries do not include model ids", async () => {
@@ -401,10 +479,11 @@ describe("discoverModels fallback to /health", () => {
     expect(result.models.map((model) => model.id)).toEqual(["azure/gpt-35-turbo", "anthropic/claude-3-5-sonnet"]);
     expect(result.models[1]).toMatchObject({
       name: "anthropic/claude-3-5-sonnet",
+      api: "anthropic-messages",
       contextWindow: 128000,
       maxTokens: 16384,
-      compat: { supportsStore: false, cacheControlFormat: "anthropic" },
     });
+    expect(result.models[1]?.compat).toEqual({});
   });
 });
 

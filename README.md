@@ -103,6 +103,21 @@ A `providers.litellm` block (in `models.json` or `settings.json`) and stored pi 
 /model
 ```
 
+## Model routing
+
+Discovered models are registered under the `litellm` provider with the OpenAI-compatible
+`openai-completions` API by default. Anthropic-backed models (Claude/Opus/Sonnet/Haiku ids, an
+`anthropic/...` route prefix, or `owned_by: "anthropic"`) are instead registered under Pi's native
+`anthropic-messages` API and pinned to the LiteLLM root so requests hit the proxy's Anthropic
+`/v1/messages` endpoint. This lets thinking, cache control, and adaptive effort use Pi's native
+Anthropic implementation.
+
+Models that require adaptive thinking (Opus 4.6+, Sonnet 4.6, Fable 5) are marked with
+`forceAdaptiveThinking`, so Pi sends `thinking: { type: "adaptive" }` with an `output_config.effort`
+instead of the older `thinking: { type: "enabled" }` budget format that these models reject on
+Bedrock. Using these models requires that your LiteLLM proxy expose the Anthropic-compatible
+`/v1/messages` endpoint.
+
 ## Optional environment variables
 
 | Variable | Default | Effect |

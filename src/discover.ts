@@ -60,6 +60,39 @@ export function shouldSuppressReasoningContent(modelId: string): boolean {
   return isMoonshotModel(modelId) && !FORCED_THINKING_MODEL_PATTERN.test(modelId);
 }
 
+// Newer Claude models (Opus 4.6+, Sonnet 4.6, Fable 5) require `thinking.type: "adaptive"`
+// with an `output_config.effort` and reject the older `thinking.type: "enabled"` budget
+// format. Mirrors pi-ai's amazon-bedrock/anthropic adaptive-thinking detection so discovered
+// LiteLLM models opt into the same native handling instead of the OpenAI-completions
+// translation that LiteLLM turns into the rejected `thinking.type.enabled`.
+const ANTHROPIC_ADAPTIVE_THINKING_IDS = ["opus-4-6", "opus-4-7", "opus-4-8", "sonnet-4-6", "fable-5"];
+
+export function supportsAdaptiveThinking(modelId: string): boolean {
+  const normalized = modelId.toLowerCase().replace(/[\s_.:]+/g, "-");
+  return ANTHROPIC_ADAPTIVE_THINKING_IDS.some((needle) => normalized.includes(needle));
+}
+
+export function isAnthropicModel(modelId: string, ownedBy?: string): boolean {
+  return ANTHROPIC_MODEL_PATTERN.test(modelId) || ownedBy?.toLowerCase() === "anthropic";
+}
+
+// Anthropic-backed models are registered under pi's native `anthropic-messages` API so
+// thinking, cache control, and adaptive effort use pi core's implementation. All other
+// models fall through to the provider-level `openai-completions` default.
+export function resolveModelApi(modelId: string, ownedBy?: string): Api | undefined {
+  return isAnthropicModel(modelId, ownedBy) ? "anthropic-messages" : undefined;
+}
+
+export function buildAnthropicCompat(modelId: string): ProviderModelConfig["compat"] {
+  return supportsAdaptiveThinking(modelId) ? { forceAdaptiveThinking: true } : {};
+}
+
+// Dispatches to Anthropic Messages compat for Anthropic-backed models and to the
+// OpenAI-completions compat (buildCompat) for everything else.
+export function buildDiscoveredCompat(modelId: string, ownedBy?: string): ProviderModelConfig["compat"] {
+  return isAnthropicModel(modelId, ownedBy) ? buildAnthropicCompat(modelId) : buildCompat(modelId);
+}
+
 export function buildCompat(modelId: string): ProviderModelConfig["compat"] {
   if (isMoonshotModel(modelId)) {
     return {
@@ -254,12 +287,14 @@ function mapFromModelInfo(entry: ModelInfoEntry): ProviderModelConfig | undefine
   return {
     id,
     name: id,
+    api: resolveModelApi(id),
     reasoning: info.supports_reasoning ?? false,
+    thinkingLevelMap: catalogModel?.thinkingLevelMap,
     input: info.supports_vision ? ["text", "image"] : ["text"],
     cost: mapModelInfoCost(info, catalogModel?.cost),
     contextWindow: info.max_input_tokens ?? DEFAULT_CONTEXT_WINDOW,
     maxTokens: info.max_output_tokens ?? DEFAULT_MAX_TOKENS,
-    compat: buildCompat(id),
+    compat: buildDiscoveredCompat(id),
   };
 }
 
@@ -275,12 +310,14 @@ function mapFromHealthModelInfo(
   return {
     id: fallbackId,
     name: fallbackId,
+    api: resolveModelApi(fallbackId),
     reasoning: info.supports_reasoning ?? false,
+    thinkingLevelMap: catalogModel?.thinkingLevelMap,
     input: info.supports_vision ? ["text", "image"] : ["text"],
     cost: mapModelInfoCost(info, catalogModel?.cost),
     contextWindow: info.max_input_tokens ?? DEFAULT_CONTEXT_WINDOW,
     maxTokens: info.max_output_tokens ?? DEFAULT_MAX_TOKENS,
-    compat: buildCompat(fallbackId),
+    compat: buildDiscoveredCompat(fallbackId),
   };
 }
 
@@ -291,13 +328,14 @@ function mapFromHealthEndpoint(entry: { model?: string }): ProviderModelConfig |
   return {
     id,
     name: catalogModel?.name ?? id,
+    api: resolveModelApi(id),
     reasoning: catalogModel?.reasoning ?? false,
     thinkingLevelMap: catalogModel?.thinkingLevelMap,
     input: catalogModel?.input ?? ["text"],
     cost: catalogModel?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: catalogModel?.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
     maxTokens: catalogModel?.maxTokens ?? DEFAULT_MAX_TOKENS,
-    compat: buildCompat(id),
+    compat: buildDiscoveredCompat(id),
   };
 }
 
@@ -312,13 +350,14 @@ function mapFromModelsList(
   return {
     id,
     name: modelsDevMetadata.name ?? catalogModel?.name ?? `${id} (no metadata)`,
+    api: resolveModelApi(id, entry.owned_by),
     reasoning: modelsDevMetadata.reasoning ?? catalogModel?.reasoning ?? false,
     thinkingLevelMap: catalogModel?.thinkingLevelMap,
     input: modelsDevMetadata.input ?? catalogModel?.input ?? ["text"],
     cost: modelsDevMetadata.cost ?? catalogModel?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: modelsDevMetadata.contextWindow ?? catalogModel?.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
     maxTokens: modelsDevMetadata.maxTokens ?? catalogModel?.maxTokens ?? DEFAULT_MAX_TOKENS,
-    compat: buildCompat(id),
+    compat: buildDiscoveredCompat(id, entry.owned_by),
   };
 }
 
