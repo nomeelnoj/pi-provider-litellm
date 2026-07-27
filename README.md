@@ -61,6 +61,23 @@ The `apiKey` value uses the same value-resolution syntax as the rest of `models.
 
 > `settings.json` is also accepted as a fallback (same `providers.litellm` shape, plus a top-level `litellm` alias), but `models.json` is the recommended home.
 
+#### Multiple LiteLLM proxies
+
+You can manage more than one LiteLLM proxy at once. Any `providers.<name>` block that carries `"kind": "litellm"` is registered as its own provider (arbitrary name, its own `baseUrl`/`apiKey`, and its own name-scoped model cache at `~/.pi/agent/litellm-models.<name>.json`):
+
+```json
+{
+  "providers": {
+    "litellm": { "baseUrl": "https://litellm.prd.example.com", "apiKey": "$LITELLM_TOKEN" },
+    "litellm-dev": { "kind": "litellm", "baseUrl": "https://litellm.dev.example.com", "apiKey": "$LITELLM_DEV_TOKEN" }
+  }
+}
+```
+
+- The block named exactly `litellm` is the **default instance** and keeps every credential fallback (`settings.json`, `/login litellm`, Google ADC, `LITELLM_API_KEY_HELPER`, `LITELLM_API_KEY`) plus Skills-gateway prompt injection and MCP tools.
+- Every other marked instance is **config-only**: its credentials come solely from its own block (`$ENV` / `!command` still resolved inline). No env-var, `auth.json`, `/login`, or helper fallbacks.
+- Each instance discovers and registers its models independently; select them in `/model` under their respective provider names.
+
 ### Option B — interactive login
 
 Inside pi:
@@ -194,11 +211,12 @@ Before tagging a release, keep `package.json` and `package-lock.json` versions i
 
 ## Slash commands
 
-- `/litellm-refresh` — force re-fetch the model list, ignoring cache
+- `/litellm-refresh` — force re-fetch the model list for every managed instance, ignoring cache
+- `/litellm-refresh <name>` — refresh only the named instance (e.g. `/litellm-refresh litellm-dev`)
 
 ## Cache
 
-The model list is cached at `~/.pi/agent/litellm-models.json` with a keyed fingerprint of the base URL + API key. Changing either invalidates the cache automatically.
+The default instance's model list is cached at `~/.pi/agent/litellm-models.json` with a keyed fingerprint of the base URL + API key. Additional instances use name-scoped files (`~/.pi/agent/litellm-models.<name>.json`). Changing an instance's base URL or key invalidates its cache automatically.
 
 If the cache is older than 24 hours, the extension refreshes it in the background on session start (non-blocking). Failures are silent — the cached models remain in use. Run `/litellm-refresh` to force an immediate refresh.
 
