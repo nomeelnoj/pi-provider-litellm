@@ -26,6 +26,12 @@ import type {
 } from "./types.js";
 
 const PROVIDER_NAME = "litellm";
+// Marker that opts a `providers.<name>` block into management by this extension,
+// allowing multiple LiteLLM instances under arbitrary provider names. The block
+// named exactly `litellm` is always managed (backward compatible) and is the
+// "default" instance that retains env-var / auth.json / /login / helper fallbacks;
+// every other managed instance is config-only (baseUrl + apiKey from its block).
+const LITELLM_KIND = "litellm";
 const ENV_BASE_URL = "LITELLM_BASE_URL";
 const ENV_API_KEY = "LITELLM_API_KEY";
 const ENV_API_KEY_HELPER = "LITELLM_API_KEY_HELPER";
@@ -47,8 +53,12 @@ function getAuthPath(): string {
   return join(getAgentDir(), "auth.json");
 }
 
-function getCachePath(): string {
-  return join(getAgentDir(), CACHE_FILENAME);
+// Per-instance cache file. The default instance keeps the historical
+// `litellm-models.json` name; extra instances get a name-scoped file so their
+// discovered model lists never collide.
+function getCachePath(instanceName: string = PROVIDER_NAME): string {
+  if (instanceName === PROVIDER_NAME) return join(getAgentDir(), CACHE_FILENAME);
+  return join(getAgentDir(), `litellm-models.${instanceName}.json`);
 }
 
 function getModelsPath(): string {
@@ -59,11 +69,11 @@ function getSettingsPath(): string {
   return join(getAgentDir(), SETTINGS_FILENAME);
 }
 
-async function readAuthEntry(): Promise<AuthFileEntry | undefined> {
+async function readAuthEntry(name: string = PROVIDER_NAME): Promise<AuthFileEntry | undefined> {
   try {
     const raw = await readFile(getAuthPath(), "utf8");
     const parsed = JSON.parse(raw) as Record<string, AuthFileEntry>;
-    return parsed?.[PROVIDER_NAME];
+    return parsed?.[name];
   } catch {
     return undefined;
   }
@@ -75,6 +85,7 @@ async function readAuthEntry(): Promise<AuthFileEntry | undefined> {
 // auth.json is read) because their typed schemas do not surface this plugin's keys.
 async function readProviderEntryFromFile(
   path: string,
+  name: string = PROVIDER_NAME,
   { allowTopLevelAlias = false }: { allowTopLevelAlias?: boolean } = {},
 ): Promise<ConfiguredProviderEntry | undefined> {
   try {
@@ -82,7 +93,7 @@ async function readProviderEntryFromFile(
       providers?: Record<string, unknown>;
       [key: string]: unknown;
     };
-    const entry = parsed?.providers?.[PROVIDER_NAME] ?? (allowTopLevelAlias ? parsed?.[PROVIDER_NAME] : undefined);
+    const entry = parsed?.providers?.[name] ?? (allowTopLevelAlias ? parsed?.[name] : undefined);
     if (!entry || typeof entry !== "object") return undefined;
     const { baseUrl: rawBaseUrl, apiKey: rawApiKey } = entry as Record<string, unknown>;
     const baseUrl = typeof rawBaseUrl === "string" ? cleanConfig(rawBaseUrl) : undefined;
@@ -95,12 +106,59 @@ async function readProviderEntryFromFile(
 
 // Pi's native `models.json` is the first-class home for provider config; settings.json
 // is supported as a secondary fallback so a single block works in either file.
-async function readModelsEntry(): Promise<ConfiguredProviderEntry | undefined> {
-  return readProviderEntryFromFile(getModelsPath());
+async function readModelsEntry(name: string = PROVIDER_NAME): Promise<ConfiguredProviderEntry | undefined> {
+  return readProviderEntryFromFile(getModelsPath(), name);
 }
 
-async function readSettingsEntry(): Promise<ConfiguredProviderEntry | undefined> {
-  return readProviderEntryFromFile(getSettingsPath(), { allowTopLevelAlias: true });
+async function readSettingsEntry(
+  name: string = PROVIDER_NAME,
+  { allowTopLevelAlias = true }: { allowTopLevelAlias?: boolean } = {},
+): Promise<ConfiguredProviderEntry | undefined> {
+  return readProviderEntryFromFile(getSettingsPath(), name, { allowTopLevelAlias });
+}
+
+// Raw `providers` map from a Pi config file, used to detect which blocks opt into
+// management via the `kind: "litellm"` marker. Returns an empty object on any
+// read/parse failure so discovery degrades to "default instance only".
+async function readProvidersMap(path: string): Promise<Record<string, Record<string, unknown>>> {
+  try {
+    const parsed = JSON.parse(await readFile(path, "utf8")) as { providers?: Record<string, unknown> };
+    const providers = parsed?.providers;
+    if (!providers || typeof providers !== "object") return {};
+    const out: Record<string, Record<string, unknown>> = {};
+    for (const [key, value] of Object.entries(providers)) {
+      if (value && typeof value === "object") out[key] = value as Record<string, unknown>;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+// One managed LiteLLM instance. `isDefault` marks the block named `litellm`, which
+// keeps env-var / auth.json / /login / helper credential fallbacks; every other
+// instance is config-only.
+export interface InstanceConfig {
+  name: string;
+  isDefault: boolean;
+}
+
+// Discovers the set of managed instances: always the default `litellm` instance,
+// plus any `providers.<name>` block (in models.json or settings.json) that carries
+// `kind: "litellm"`. The default is returned first (tests and back-compat rely on
+// the default provider registering first); extras follow in stable sorted order.
+async function discoverInstances(): Promise<InstanceConfig[]> {
+  const maps = [await readProvidersMap(getModelsPath()), await readProvidersMap(getSettingsPath())];
+  const extras = new Set<string>();
+  for (const map of maps) {
+    for (const [name, block] of Object.entries(map)) {
+      if (name === PROVIDER_NAME) continue;
+      if (typeof block.kind === "string" && block.kind.trim().toLowerCase() === LITELLM_KIND) extras.add(name);
+    }
+  }
+  const instances: InstanceConfig[] = [{ name: PROVIDER_NAME, isDefault: true }];
+  for (const name of [...extras].sort()) instances.push({ name, isDefault: false });
+  return instances;
 }
 
 const LEGACY_ENV_VAR_NAME_RE = /^[A-Z_][A-Z0-9_]*$/;
@@ -274,17 +332,36 @@ function resolveOAuthApiKey(credentials: OAuthCredentials): string {
     : getLiteLLMApiKey(credentials);
 }
 
-async function resolveCredentials({ executeHelpers = true } = {}): Promise<ResolvedCredentials> {
+async function resolveCredentials({
+  executeHelpers = true,
+  instanceName = PROVIDER_NAME,
+  isDefault = true,
+}: { executeHelpers?: boolean; instanceName?: string; isDefault?: boolean } = {}): Promise<ResolvedCredentials> {
   // models.json is Pi's first-class provider-config home; settings.json is a fallback.
-  const modelsEntry: ConfiguredProviderEntry | undefined = await readModelsEntry();
-  const settingsEntry: ConfiguredProviderEntry | undefined = await readSettingsEntry();
+  const modelsEntry: ConfiguredProviderEntry | undefined = await readModelsEntry(instanceName);
+  const settingsEntry: ConfiguredProviderEntry | undefined = await readSettingsEntry(instanceName, {
+    allowTopLevelAlias: isDefault,
+  });
   const configEntry: ConfiguredProviderEntry = {
     baseUrl: modelsEntry?.baseUrl ?? settingsEntry?.baseUrl,
     apiKey: modelsEntry?.apiKey ?? settingsEntry?.apiKey,
   };
   const configKey = resolveConfiguredApiKey(configEntry.apiKey, executeHelpers);
   const configBase = configEntry.baseUrl?.trim();
-  const entry = await readAuthEntry();
+
+  // Non-default instances are config-only: credentials come solely from their
+  // models.json/settings.json block (inline $ENV / !command still resolved by
+  // resolveConfiguredApiKey). No env-var, auth.json, gcloud, or helper fallbacks.
+  if (!isDefault) {
+    return {
+      baseUrl: configBase ? normalizeBaseUrl(configBase) : undefined,
+      apiKey: configKey.apiKey || undefined,
+      apiKeyFingerprint: configKey.apiKeyFingerprint,
+      apiKeyConfig: configKey.apiKeyConfig,
+    };
+  }
+
+  const entry = await readAuthEntry(instanceName);
   const envBase = cleanConfig(process.env[ENV_BASE_URL]);
   const envKey = cleanConfig(process.env[ENV_API_KEY]);
   const envHelperCommand = getApiKeyHelperCommand();
