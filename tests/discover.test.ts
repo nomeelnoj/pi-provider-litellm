@@ -149,7 +149,13 @@ describe("supportsAdaptiveThinking", () => {
   });
 
   it("does not flag older Claude models, including the 4.5 boundary", () => {
-    for (const id of ["claude-3-5-sonnet", "claude-3-7-sonnet", "haiku-4-5", "opus-4-5", "claude-sonnet-4-5-20250929"]) {
+    for (const id of [
+      "claude-3-5-sonnet",
+      "claude-3-7-sonnet",
+      "haiku-4-5",
+      "opus-4-5",
+      "claude-sonnet-4-5-20250929",
+    ]) {
       expect(supportsAdaptiveThinking(id)).toBe(false);
     }
   });
