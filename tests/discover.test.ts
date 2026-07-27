@@ -135,10 +135,21 @@ describe("supportsAdaptiveThinking", () => {
     }
   });
 
-  it("does not flag older Claude models", () => {
-    for (const id of ["claude-3-5-sonnet", "opus-4.7-preview", "haiku-4.5"]) {
-      // opus-4.7 is adaptive; ensure only the intended families flip on.
-      if (id.includes("4-7") || id.includes("4.7")) continue;
+  it("flags the 5.x generation and beyond automatically (no id list to maintain)", () => {
+    for (const id of [
+      "claude-opus-5",
+      "claude-sonnet-5",
+      "claude-opus-5-lenient",
+      "anthropic/claude-sonnet-5",
+      "opus-5.1",
+      "claude-opus-6",
+    ]) {
+      expect(supportsAdaptiveThinking(id)).toBe(true);
+    }
+  });
+
+  it("does not flag older Claude models, including the 4.5 boundary", () => {
+    for (const id of ["claude-3-5-sonnet", "claude-3-7-sonnet", "haiku-4-5", "opus-4-5", "claude-sonnet-4-5-20250929"]) {
       expect(supportsAdaptiveThinking(id)).toBe(false);
     }
   });
@@ -158,6 +169,8 @@ describe("resolveModelApi", () => {
 describe("buildDiscoveredCompat", () => {
   it("emits forceAdaptiveThinking for adaptive Claude models", () => {
     expect(buildDiscoveredCompat("claude-opus-4-8")).toEqual({ forceAdaptiveThinking: true });
+    expect(buildDiscoveredCompat("claude-opus-5")).toEqual({ forceAdaptiveThinking: true });
+    expect(buildDiscoveredCompat("claude-sonnet-5")).toEqual({ forceAdaptiveThinking: true });
   });
 
   it("emits empty anthropic compat for non-adaptive Claude models", () => {

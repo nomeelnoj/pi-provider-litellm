@@ -65,11 +65,23 @@ export function shouldSuppressReasoningContent(modelId: string): boolean {
 // format. Mirrors pi-ai's amazon-bedrock/anthropic adaptive-thinking detection so discovered
 // LiteLLM models opt into the same native handling instead of the OpenAI-completions
 // translation that LiteLLM turns into the rejected `thinking.type.enabled`.
-const ANTHROPIC_ADAPTIVE_THINKING_IDS = ["opus-4-6", "opus-4-7", "opus-4-8", "sonnet-4-6", "fable-5"];
+// Adaptive thinking (`thinking.type: "adaptive"` + `output_config.effort`) is required by
+// Claude Opus/Sonnet 4.6+ and every newer generation (5.x, fable-5, and beyond); those
+// models reject the legacy `thinking.type: "enabled"` budget format. Older models
+// (Opus/Sonnet <= 4.5, Haiku, 3.x) still use the legacy format. Detecting by family +
+// version instead of a hardcoded id list means new releases (opus-5, sonnet-6, ...) opt
+// into adaptive thinking automatically — no per-model edits when Anthropic ships a model.
+const ADAPTIVE_THINKING_FAMILY_RE = /(?:^|[-/])(opus|sonnet|fable)-(\d+)(?:-(\d+))?/;
 
 export function supportsAdaptiveThinking(modelId: string): boolean {
   const normalized = modelId.toLowerCase().replace(/[\s_.:]+/g, "-");
-  return ANTHROPIC_ADAPTIVE_THINKING_IDS.some((needle) => normalized.includes(needle));
+  const match = ADAPTIVE_THINKING_FAMILY_RE.exec(normalized);
+  if (!match) return false;
+  const major = Number.parseInt(match[2], 10);
+  if (Number.isNaN(major)) return false;
+  const minor = match[3] !== undefined ? Number.parseInt(match[3], 10) : 0;
+  // Opus/Sonnet/Fable at 4.6+ or any 5.x+ generation.
+  return major > 4 || (major === 4 && minor >= 6);
 }
 
 export function isAnthropicModel(modelId: string, ownedBy?: string): boolean {
