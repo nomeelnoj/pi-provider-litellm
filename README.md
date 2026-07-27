@@ -77,6 +77,7 @@ You can manage more than one LiteLLM proxy at once. Any `providers.<name>` block
 - The block named exactly `litellm` is the **default instance** and keeps every credential fallback (`settings.json`, `/login litellm`, Google ADC, `LITELLM_API_KEY_HELPER`, `LITELLM_API_KEY`) plus Skills-gateway prompt injection and MCP tools.
 - Every other marked instance is **config-only**: its credentials come solely from its own block (`$ENV` / `!command` still resolved inline). No env-var, `auth.json`, `/login`, or helper fallbacks.
 - Each instance discovers and registers its models independently; select them in `/model` under their respective provider names.
+- Skills-gateway prompt injection and MCP tools are wired for the **default** `litellm` instance only. If you configure only a `kind: "litellm"` extra and no `litellm` block, models still work but skills/MCP are not injected.
 
 ### Option B — interactive login
 
