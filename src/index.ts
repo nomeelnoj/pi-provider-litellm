@@ -336,7 +336,11 @@ async function resolveCredentials({
   executeHelpers = true,
   instanceName = PROVIDER_NAME,
   isDefault = true,
-}: { executeHelpers?: boolean; instanceName?: string; isDefault?: boolean } = {}): Promise<ResolvedCredentials> {
+}: {
+  executeHelpers?: boolean;
+  instanceName?: string;
+  isDefault?: boolean;
+} = {}): Promise<ResolvedCredentials> {
   // models.json is Pi's first-class provider-config home; settings.json is a fallback.
   const modelsEntry: ConfiguredProviderEntry | undefined = await readModelsEntry(instanceName);
   const settingsEntry: ConfiguredProviderEntry | undefined = await readSettingsEntry(instanceName, {
@@ -777,7 +781,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     function registerProvider(
       baseUrl: string | undefined,
       regModels: ProviderModelConfig[],
-      apiKeyConfig = creds.apiKeyConfig ?? (isDefault ? (getApiKeyHelperCommand() ?? `$${ENV_API_KEY}`) : `$${ENV_API_KEY}`),
+      apiKeyConfig = creds.apiKeyConfig ??
+        (isDefault ? (getApiKeyHelperCommand() ?? `$${ENV_API_KEY}`) : `$${ENV_API_KEY}`),
     ): void {
       // Anthropic-backed models carry `api: "anthropic-messages"` from discovery; pin them to
       // the LiteLLM root so pi's Anthropic SDK targets `/v1/messages`. The rest inherit the

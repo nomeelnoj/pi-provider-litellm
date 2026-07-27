@@ -1186,3 +1186,110 @@ describe("extension startup", () => {
     ).rejects.toThrow("SSO token is required");
   });
 });
+
+describe("multiple LiteLLM instances", () => {
+  async function writeProviders(agentDir: string, providers: Record<string, unknown>): Promise<void> {
+    await writeFile(join(agentDir, "models.json"), JSON.stringify({ providers }), "utf8");
+  }
+
+  function mockPerBaseUrl(byHost: Record<string, string>): void {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes("/mcp-rest/tools/list")) return jsonResponse(200, { tools: [] });
+      for (const [host, modelName] of Object.entries(byHost)) {
+        if (url.startsWith(host) && url.endsWith("/model/info")) {
+          return jsonResponse(200, { data: [{ model_name: modelName, model_info: { mode: "chat" } }] });
+        }
+      }
+      return jsonResponse(200, {});
+    });
+  }
+
+  const TWO_INSTANCES = {
+    litellm: { baseUrl: "https://prd.example.com", apiKey: "sk-prd" },
+    "litellm-dev": { kind: "litellm", baseUrl: "https://dev.example.com", apiKey: "sk-dev" },
+  };
+  const HOSTS = { "https://prd.example.com": "prd-model", "https://dev.example.com": "dev-model" };
+
+  it("registers a marked providers block as its own instance", async () => {
+    const agentDir = await makeAgentDir();
+    await writeProviders(agentDir, TWO_INSTANCES);
+    mockPerBaseUrl(HOSTS);
+
+    const extension = await loadExtension(agentDir);
+    const pi = createPi();
+    await extension(pi);
+
+    const byName = new Map(pi.providers.map((p) => [p.name, p.config]));
+    expect([...byName.keys()].sort()).toEqual(["litellm", "litellm-dev"]);
+    // Default registers first (back-compat: consumers/tests rely on providers[0]).
+    expect(pi.providers[0]?.name).toBe("litellm");
+
+    expect(byName.get("litellm")?.baseUrl).toBe("https://prd.example.com/v1");
+    expect(byName.get("litellm")?.apiKey).toBe("sk-prd");
+    expect((byName.get("litellm")?.models ?? []).map((m) => (m as { id: string }).id)).toEqual(["prd-model"]);
+    // Default keeps interactive /login (oauth wired).
+    expect(byName.get("litellm")?.oauth).toBeDefined();
+
+    expect(byName.get("litellm-dev")?.baseUrl).toBe("https://dev.example.com/v1");
+    expect(byName.get("litellm-dev")?.apiKey).toBe("sk-dev");
+    expect((byName.get("litellm-dev")?.models ?? []).map((m) => (m as { id: string }).id)).toEqual(["dev-model"]);
+    // Extra instances are config-only: no oauth wired.
+    expect(byName.get("litellm-dev")?.oauth).toBeUndefined();
+  });
+
+  it("writes a separate name-scoped cache file per instance", async () => {
+    const agentDir = await makeAgentDir();
+    await writeProviders(agentDir, TWO_INSTANCES);
+    mockPerBaseUrl(HOSTS);
+
+    const extension = await loadExtension(agentDir);
+    await extension(createPi());
+
+    const defaultCache = JSON.parse(await readFile(join(agentDir, "litellm-models.json"), "utf8"));
+    const devCache = JSON.parse(await readFile(join(agentDir, "litellm-models.litellm-dev.json"), "utf8"));
+    expect(defaultCache.baseUrl).toBe("https://prd.example.com");
+    expect(defaultCache.models.map((m: { id: string }) => m.id)).toEqual(["prd-model"]);
+    expect(devCache.baseUrl).toBe("https://dev.example.com");
+    expect(devCache.models.map((m: { id: string }) => m.id)).toEqual(["dev-model"]);
+  });
+
+  it("ignores an unmarked non-litellm provider block", async () => {
+    const agentDir = await makeAgentDir();
+    await writeProviders(agentDir, {
+      litellm: { baseUrl: "https://prd.example.com", apiKey: "sk-prd" },
+      other: { baseUrl: "https://other.example.com", apiKey: "sk-other" },
+    });
+    mockPerBaseUrl({ "https://prd.example.com": "prd-model", "https://other.example.com": "other-model" });
+
+    const extension = await loadExtension(agentDir);
+    const pi = createPi();
+    await extension(pi);
+
+    expect(pi.providers.map((p) => p.name)).toEqual(["litellm"]);
+  });
+
+  it("refreshes only the named instance via /litellm-refresh <name>", async () => {
+    const agentDir = await makeAgentDir();
+    await writeProviders(agentDir, TWO_INSTANCES);
+    mockPerBaseUrl(HOSTS);
+
+    const extension = await loadExtension(agentDir);
+    const pi = createPi();
+    await extension(pi);
+
+    const infoCalls = (): string[] =>
+      (globalThis.fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls
+        .map((c) => String(c[0]))
+        .filter((u) => u.endsWith("/model/info"));
+    const before = infoCalls().length;
+    const notify = vi.fn();
+    await pi.commands.get("litellm-refresh")?.handler("litellm-dev", { ui: { notify } });
+    const added = infoCalls().slice(before);
+
+    expect(added.length).toBeGreaterThan(0);
+    expect(added.every((u) => u.startsWith("https://dev.example.com"))).toBe(true);
+    expect(added.some((u) => u.startsWith("https://prd.example.com"))).toBe(false);
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("LiteLLM[litellm-dev]: 1 models refreshed"), "info");
+  });
+});
