@@ -560,10 +560,10 @@ function litellmModelBaseUrl(baseUrl: string, api: Api | undefined): string {
   return api === "anthropic-messages" ? baseUrl : `${baseUrl}/v1`;
 }
 
-function modifyLiteLLMModels(models: Model<Api>[], cred: OAuthCredentials): Model<Api>[] {
+function modifyLiteLLMModels(models: Model<Api>[], cred: OAuthCredentials, instanceName: string): Model<Api>[] {
   const baseUrl = (cred as { baseUrl?: string }).baseUrl;
   if (!baseUrl) return models;
-  return models.map((m) => (m.provider === PROVIDER_NAME ? { ...m, baseUrl: litellmModelBaseUrl(baseUrl, m.api) } : m));
+  return models.map((m) => (m.provider === instanceName ? { ...m, baseUrl: litellmModelBaseUrl(baseUrl, m.api) } : m));
 }
 
 function prepareLiteLLMRequestPayload(
@@ -596,8 +596,11 @@ function prepareLiteLLMRequestPayload(
   return next;
 }
 
-function normalizeThinkTags(message: AssistantMessage): AssistantMessage | undefined {
-  if (message.provider !== PROVIDER_NAME || !shouldSuppressReasoningContent(message.model)) return;
+function normalizeThinkTags(
+  message: AssistantMessage,
+  isManaged: (provider: string) => boolean,
+): AssistantMessage | undefined {
+  if (!isManaged(message.provider) || !shouldSuppressReasoningContent(message.model)) return;
 
   let changed = false;
   const content: AssistantMessage["content"] = [];
@@ -658,119 +661,29 @@ function normalizeThinkTags(message: AssistantMessage): AssistantMessage | undef
   return { ...message, content };
 }
 
+type LoginContext = Pick<ExtensionContext, "modelRegistry" | "signal" | "ui">;
+
+interface InstanceRuntime {
+  name: string;
+  isDefault: boolean;
+  baseUrl: string | undefined;
+  getCacheFetchedAt: () => number;
+  refresh: () => Promise<RefreshResult>;
+  runLogin?: (ctx: LoginContext) => Promise<void>;
+}
+
 export default async function (pi: ExtensionAPI): Promise<void> {
-  let creds = await resolveCredentials({ executeHelpers: false });
-  const cache = await readCache(getCachePath());
-  let fp = creds.apiKeyFingerprint;
-  let cacheFetchedAt = cache?.fetchedAt ?? 0;
+  const instances = await discoverInstances();
 
-  const cacheValid =
-    cache !== null &&
-    creds.baseUrl !== undefined &&
-    fp !== undefined &&
-    cache.baseUrl === creds.baseUrl &&
-    cache.apiKeyFingerprint === fp;
-
-  let models: ProviderModelConfig[] = cacheValid && cache ? cache.models : [];
-  const shouldFetch =
-    creds.baseUrl !== undefined &&
-    fp !== undefined &&
-    !isOffline() &&
-    getDiscoveryTimeoutMs() > 0 &&
-    (!cacheValid || isListModelsMode());
-
-  let credentialWarning: string | undefined;
-  let liveDiscoveryApiKey: string | undefined;
-  if (shouldFetch) {
-    try {
-      creds = await resolveCredentials();
-      fp = creds.apiKeyFingerprint;
-    } catch (error) {
-      if (!cacheValid || !cache) throw error;
-      credentialWarning = error instanceof Error ? error.message : String(error);
-      process.stderr.write(`LiteLLM: discovery failed (${credentialWarning}); using cached models.\n`);
-      models = cache.models;
-    }
-  }
-
-  if (shouldFetch && !credentialWarning && creds.baseUrl && creds.apiKey && fp) {
-    const timeoutMs = getDiscoveryTimeoutMs();
-    const { result, warning } = await discoverWithFallback(creds.baseUrl, creds.apiKey, {
-      timeoutMs,
-    });
-    if (warning) {
-      if (cacheValid && cache) {
-        process.stderr.write(`LiteLLM: discovery failed (${warning}); using cached models.\n`);
-        models = cache.models;
-      } else {
-        process.stderr.write(`LiteLLM: discovery failed (${warning}); registering provider with no models.\n`);
-        models = [];
-      }
-    } else {
-      models = result.models;
-      liveDiscoveryApiKey = creds.apiKey;
-      const next: CacheFile = {
-        baseUrl: creds.baseUrl,
-        apiKeyFingerprint: fp,
-        fetchedAt: Date.now(),
-        source: result.source,
-        models: result.models,
-      };
-      await writeCache(getCachePath(), next);
-      cacheFetchedAt = next.fetchedAt;
-      if (isListModelsMode()) {
-        process.stderr.write(`LiteLLM: ${result.models.length} models discovered (source: ${result.source}).\n`);
-      }
-    }
-  }
-
+  // Cross-instance shared state.
+  let sessionId: string | undefined;
+  // Single global cost tracker fed the union of every managed instance's models.
+  // Cost lookups match by model id, so N per-instance trackers would each register
+  // duplicate message_end/after_provider_response hooks and double-count. One tracker
+  // + a recompute-on-change keeps a single source of truth.
+  const modelsByInstance = new Map<string, ProviderModelConfig[]>();
   let updateCosts: (models: ProviderModelConfig[]) => void = () => undefined;
-
-  const oauth = {
-    name: "LiteLLM",
-    login: (callbacks: OAuthLoginCallbacks) =>
-      loginLiteLLM(callbacks, (next) => {
-        cacheFetchedAt = next.fetchedAt;
-        registerProvider(next.baseUrl, next.models);
-        updateCosts(next.models);
-      }),
-    refreshToken: refreshLiteLLM,
-    getApiKey: getLiteLLMApiKey,
-    modifyModels: modifyLiteLLMModels,
-  };
-
-  function registerProvider(
-    baseUrl: string | undefined,
-    models: ProviderModelConfig[],
-    apiKeyConfig = creds.apiKeyConfig ?? getApiKeyHelperCommand() ?? `$${ENV_API_KEY}`,
-  ): void {
-    // Anthropic-backed models carry `api: "anthropic-messages"` from discovery; pin them to
-    // the LiteLLM root so pi's Anthropic SDK targets `/v1/messages`. The rest inherit the
-    // provider-level `openai-completions` API and `/v1` base.
-    const preparedModels = baseUrl
-      ? models.map((m) => (m.api === "anthropic-messages" ? { ...m, baseUrl } : m))
-      : models;
-    pi.registerProvider(PROVIDER_NAME, {
-      baseUrl: baseUrl ? `${baseUrl}/v1` : "https://litellm.example.com/v1",
-      // When LITELLM_API_KEY_HELPER is set we register the helper as a `!command` provider key.
-      // Pi's per-request auth path (ModelRegistry.getApiKeyAndHeaders) resolves provider keys via
-      // resolveConfigValueOrThrow -> resolveConfigValueUncached, i.e. the command is re-executed on
-      // every request (it does NOT use the process-lifetime command cache, which only applies to
-      // resolveConfigValue). So a short-lived/rotating helper token stays fresh. The OAuth hooks
-      // remain registered for `/login litellm` users. See the regression test
-      // "re-runs the helper command on every request" in tests/index.test.ts.
-      apiKey: apiKeyConfig,
-      api: "openai-completions",
-      models: preparedModels,
-      oauth,
-    });
-  }
-
-  registerProvider(creds.baseUrl, models);
-
-  updateCosts = setupLiteLLMCostTracking(pi, models);
-
-  let refreshInProgress: Promise<RefreshResult> | null = null;
+  const recomputeCosts = (): void => updateCosts([...modelsByInstance.values()].flat());
 
   function discoveryDisabledReason(): string | null {
     if (isOffline()) return `${ENV_OFFLINE}=1`;
@@ -778,154 +691,320 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     return null;
   }
 
-  async function resolveRuntimeApiKey(): Promise<string> {
-    const fresh = await resolveCredentials();
-    if (!fresh.apiKey) throw new Error("no credentials. Run /login litellm or set env vars.");
-    return fresh.apiKey;
-  }
+  // Sets up one managed instance: resolve creds (instance-aware), load/refresh its
+  // own cache, register it as its own provider, and return a runtime handle. The
+  // default instance additionally wires skills/MCP tools and interactive /login;
+  // extra instances are config-only (models + cost + refresh + shared hooks).
+  async function setupInstance(instance: InstanceConfig): Promise<InstanceRuntime> {
+    const { name, isDefault } = instance;
+    const label = isDefault ? "LiteLLM" : `LiteLLM[${name}]`;
+    const cachePath = getCachePath(name);
+    let creds = await resolveCredentials({ executeHelpers: false, instanceName: name, isDefault });
+    const cache = await readCache(cachePath);
+    let fp = creds.apiKeyFingerprint;
+    let cacheFetchedAt = cache?.fetchedAt ?? 0;
 
-  function registerSkillTools(baseUrl: string | undefined): void {
-    if (!baseUrl) return;
-    for (const tool of createSkillToolDefinitions(baseUrl, resolveRuntimeApiKey)) {
-      pi.registerTool(tool);
-    }
-  }
+    const cacheValid =
+      cache !== null &&
+      creds.baseUrl !== undefined &&
+      fp !== undefined &&
+      cache.baseUrl === creds.baseUrl &&
+      cache.apiKeyFingerprint === fp;
 
-  function seededRuntimeApiKey(seed: string): () => Promise<string> {
-    let first: string | undefined = seed;
-    return async () => {
-      if (first) {
-        const value = first;
-        first = undefined;
-        return value;
+    let models: ProviderModelConfig[] = cacheValid && cache ? cache.models : [];
+    const shouldFetch =
+      creds.baseUrl !== undefined &&
+      fp !== undefined &&
+      !isOffline() &&
+      getDiscoveryTimeoutMs() > 0 &&
+      (!cacheValid || isListModelsMode());
+
+    let credentialWarning: string | undefined;
+    let liveDiscoveryApiKey: string | undefined;
+    if (shouldFetch) {
+      try {
+        creds = await resolveCredentials({ instanceName: name, isDefault });
+        fp = creds.apiKeyFingerprint;
+      } catch (error) {
+        if (!cacheValid || !cache) throw error;
+        credentialWarning = error instanceof Error ? error.message : String(error);
+        process.stderr.write(`${label}: discovery failed (${credentialWarning}); using cached models.\n`);
+        models = cache.models;
       }
-      return resolveRuntimeApiKey();
+    }
+
+    if (shouldFetch && !credentialWarning && creds.baseUrl && creds.apiKey && fp) {
+      const timeoutMs = getDiscoveryTimeoutMs();
+      const { result, warning } = await discoverWithFallback(creds.baseUrl, creds.apiKey, { timeoutMs });
+      if (warning) {
+        if (cacheValid && cache) {
+          process.stderr.write(`${label}: discovery failed (${warning}); using cached models.\n`);
+          models = cache.models;
+        } else {
+          process.stderr.write(`${label}: discovery failed (${warning}); registering provider with no models.\n`);
+          models = [];
+        }
+      } else {
+        models = result.models;
+        liveDiscoveryApiKey = creds.apiKey;
+        const now = Date.now();
+        await writeCache(cachePath, {
+          baseUrl: creds.baseUrl,
+          apiKeyFingerprint: fp,
+          fetchedAt: now,
+          source: result.source,
+          models: result.models,
+        });
+        cacheFetchedAt = now;
+        if (isListModelsMode()) {
+          process.stderr.write(`${label}: ${result.models.length} models discovered (source: ${result.source}).\n`);
+        }
+      }
+    }
+
+    const oauth = {
+      name: "LiteLLM",
+      login: (callbacks: OAuthLoginCallbacks) =>
+        loginLiteLLM(callbacks, (next) => {
+          cacheFetchedAt = next.fetchedAt;
+          registerProvider(next.baseUrl, next.models);
+        }),
+      refreshToken: refreshLiteLLM,
+      getApiKey: getLiteLLMApiKey,
+      modifyModels: (m: Model<Api>[], cred: OAuthCredentials) => modifyLiteLLMModels(m, cred, name),
+    };
+
+    function registerProvider(
+      baseUrl: string | undefined,
+      regModels: ProviderModelConfig[],
+      apiKeyConfig = creds.apiKeyConfig ?? (isDefault ? (getApiKeyHelperCommand() ?? `$${ENV_API_KEY}`) : `$${ENV_API_KEY}`),
+    ): void {
+      // Anthropic-backed models carry `api: "anthropic-messages"` from discovery; pin them to
+      // the LiteLLM root so pi's Anthropic SDK targets `/v1/messages`. The rest inherit the
+      // provider-level `openai-completions` API and `/v1` base.
+      const preparedModels = baseUrl
+        ? regModels.map((m) => (m.api === "anthropic-messages" ? { ...m, baseUrl } : m))
+        : regModels;
+      pi.registerProvider(name, {
+        baseUrl: baseUrl ? `${baseUrl}/v1` : "https://litellm.example.com/v1",
+        // When LITELLM_API_KEY_HELPER is set we register the helper as a `!command` provider key.
+        // Pi's per-request auth path (ModelRegistry.getApiKeyAndHeaders) resolves provider keys via
+        // resolveConfigValueOrThrow -> resolveConfigValueUncached, i.e. the command is re-executed on
+        // every request (it does NOT use the process-lifetime command cache, which only applies to
+        // resolveConfigValue). So a short-lived/rotating helper token stays fresh. The OAuth hooks
+        // remain registered for `/login litellm` users. See the regression test
+        // "re-runs the helper command on every request" in tests/index.test.ts.
+        apiKey: apiKeyConfig,
+        api: "openai-completions",
+        models: preparedModels,
+        // Only the default instance participates in interactive /login (config-only extras
+        // resolve credentials from their own block).
+        ...(isDefault ? { oauth } : {}),
+      });
+      modelsByInstance.set(name, regModels);
+      recomputeCosts();
+    }
+
+    async function resolveRuntimeApiKey(): Promise<string> {
+      const fresh = await resolveCredentials({ instanceName: name, isDefault });
+      if (!fresh.apiKey) throw new Error("no credentials. Run /login litellm or set env vars.");
+      return fresh.apiKey;
+    }
+
+    function registerSkillTools(baseUrl: string | undefined): void {
+      if (!baseUrl) return;
+      for (const tool of createSkillToolDefinitions(baseUrl, resolveRuntimeApiKey)) {
+        pi.registerTool(tool);
+      }
+    }
+
+    function seededRuntimeApiKey(seed: string): () => Promise<string> {
+      let first: string | undefined = seed;
+      return async () => {
+        if (first) {
+          const value = first;
+          first = undefined;
+          return value;
+        }
+        return resolveRuntimeApiKey();
+      };
+    }
+
+    async function registerMcpTools(baseUrl: string | undefined, discoveryApiKey: string | undefined): Promise<void> {
+      if (!baseUrl || !discoveryApiKey || discoveryDisabledReason()) return;
+      try {
+        const tools = await createMcpToolDefinitions(baseUrl, seededRuntimeApiKey(discoveryApiKey));
+        for (const tool of tools) {
+          pi.registerTool(tool);
+        }
+      } catch (error) {
+        process.stderr.write(
+          `${label}: MCP tool discovery failed (${error instanceof Error ? error.message : String(error)}).\n`,
+        );
+      }
+    }
+
+    async function refresh(): Promise<RefreshResult> {
+      const fresh = await resolveCredentials({ instanceName: name, isDefault });
+      const freshFp = fresh.apiKeyFingerprint;
+      if (!fresh.baseUrl || !fresh.apiKey || !freshFp) {
+        throw new Error("no credentials. Run /login litellm or set env vars.");
+      }
+      const result = await discoverModels(fresh.baseUrl, fresh.apiKey, { timeoutMs: getDiscoveryTimeoutMs() });
+      const now = Date.now();
+      await writeCache(cachePath, {
+        baseUrl: fresh.baseUrl,
+        apiKeyFingerprint: freshFp,
+        fetchedAt: now,
+        source: result.source,
+        models: result.models,
+      });
+      registerProvider(fresh.baseUrl, result.models, fresh.apiKeyConfig);
+      cacheFetchedAt = now;
+      if (isDefault) await registerMcpTools(fresh.baseUrl, fresh.apiKey);
+      return { models: result.models, source: result.source };
+    }
+
+    let refreshInProgress: Promise<RefreshResult> | null = null;
+    function runRefresh(): Promise<RefreshResult> {
+      refreshInProgress ??= refresh().finally(() => {
+        refreshInProgress = null;
+      });
+      return refreshInProgress;
+    }
+
+    async function runLogin(ctx: LoginContext): Promise<void> {
+      const credential = await loginLiteLLM(
+        {
+          onAuth: ({ url, instructions }) => {
+            openInBrowser(url);
+            ctx.ui.notify(instructions ? `${url} — ${instructions}` : url, "info");
+          },
+          onDeviceCode: () => undefined,
+          onPrompt: async ({ message, placeholder }) => {
+            const value = await ctx.ui.input(message, placeholder);
+            if (value === undefined) throw new Error("Login cancelled");
+            return value;
+          },
+          onProgress: (message) => ctx.ui.notify(message, "info"),
+          onSelect: async () => undefined,
+          signal: ctx.signal,
+        },
+        (next) => {
+          cacheFetchedAt = next.fetchedAt;
+          registerProvider(next.baseUrl, next.models);
+        },
+      );
+
+      ctx.modelRegistry.authStorage.set(name, { type: "oauth", ...credential });
+      ctx.modelRegistry.refresh();
+      const credentialBaseUrl = (credential as { baseUrl?: string }).baseUrl;
+      const credentialAccess = typeof credential.access === "string" ? credential.access : undefined;
+      registerSkillTools(credentialBaseUrl);
+      await registerMcpTools(credentialBaseUrl, credentialAccess);
+      ctx.ui.notify(`Logged in to LiteLLM. Credentials saved to ${getAuthPath()}`, "info");
+    }
+
+    registerProvider(creds.baseUrl, models);
+    if (isDefault) {
+      registerSkillTools(creds.baseUrl);
+      await registerMcpTools(creds.baseUrl, liveDiscoveryApiKey);
+    }
+
+    return {
+      name,
+      isDefault,
+      baseUrl: creds.baseUrl,
+      getCacheFetchedAt: () => cacheFetchedAt,
+      refresh: runRefresh,
+      runLogin: isDefault ? runLogin : undefined,
     };
   }
 
-  async function registerMcpTools(baseUrl: string | undefined, discoveryApiKey: string | undefined): Promise<void> {
-    if (!baseUrl || !discoveryApiKey || discoveryDisabledReason()) return;
-    try {
-      const tools = await createMcpToolDefinitions(baseUrl, seededRuntimeApiKey(discoveryApiKey));
-      for (const tool of tools) {
-        pi.registerTool(tool);
+  const managed = new Map<string, InstanceRuntime>();
+  for (const instance of instances) {
+    if (instance.isDefault) {
+      // Preserve historical behavior: a fatal credential error on the default
+      // instance (e.g. a failing key helper with no cache) aborts extension load.
+      managed.set(instance.name, await setupInstance(instance));
+    } else {
+      try {
+        managed.set(instance.name, await setupInstance(instance));
+      } catch (error) {
+        process.stderr.write(
+          `LiteLLM[${instance.name}]: setup failed (${error instanceof Error ? error.message : String(error)}).\n`,
+        );
       }
-    } catch (error) {
-      process.stderr.write(
-        `LiteLLM: MCP tool discovery failed (${error instanceof Error ? error.message : String(error)}).\n`,
-      );
     }
   }
 
-  registerSkillTools(creds.baseUrl);
-  await registerMcpTools(creds.baseUrl, liveDiscoveryApiKey);
+  // Create the single cost tracker once, seeded with the union of all instances' models.
+  updateCosts = setupLiteLLMCostTracking(pi, [...modelsByInstance.values()].flat());
 
-  async function refreshModelsAndCosts(): Promise<RefreshResult> {
-    const fresh = await resolveCredentials();
-    const freshFp = fresh.apiKeyFingerprint;
-    if (!fresh.baseUrl || !fresh.apiKey || !freshFp) {
-      throw new Error("no credentials. Run /login litellm or set env vars.");
-    }
-    const result = await discoverModels(fresh.baseUrl, fresh.apiKey, { timeoutMs: getDiscoveryTimeoutMs() });
-    const now = Date.now();
-    await writeCache(getCachePath(), {
-      baseUrl: fresh.baseUrl,
-      apiKeyFingerprint: freshFp,
-      fetchedAt: now,
-      source: result.source,
-      models: result.models,
-    });
-    registerProvider(fresh.baseUrl, result.models, fresh.apiKeyConfig);
-    updateCosts(result.models);
-    cacheFetchedAt = now;
-    await registerMcpTools(fresh.baseUrl, fresh.apiKey);
-    return { models: result.models, source: result.source };
-  }
-
-  function runRefresh(): Promise<RefreshResult> {
-    refreshInProgress ??= refreshModelsAndCosts().finally(() => {
-      refreshInProgress = null;
-    });
-    return refreshInProgress;
-  }
-
-  type LoginContext = Pick<ExtensionContext, "modelRegistry" | "signal" | "ui">;
-
-  async function runLogin(ctx: LoginContext): Promise<void> {
-    const credential = await loginLiteLLM(
-      {
-        onAuth: ({ url, instructions }) => {
-          openInBrowser(url);
-          ctx.ui.notify(instructions ? `${url} — ${instructions}` : url, "info");
-        },
-        onDeviceCode: () => undefined,
-        onPrompt: async ({ message, placeholder }) => {
-          const value = await ctx.ui.input(message, placeholder);
-          if (value === undefined) throw new Error("Login cancelled");
-          return value;
-        },
-        onProgress: (message) => ctx.ui.notify(message, "info"),
-        onSelect: async () => undefined,
-        signal: ctx.signal,
-      },
-      (next) => {
-        cacheFetchedAt = next.fetchedAt;
-        registerProvider(next.baseUrl, next.models);
-        updateCosts(next.models);
-      },
-    );
-
-    ctx.modelRegistry.authStorage.set(PROVIDER_NAME, { type: "oauth", ...credential });
-    ctx.modelRegistry.refresh();
-    const credentialBaseUrl = (credential as { baseUrl?: string }).baseUrl;
-    const credentialAccess = typeof credential.access === "string" ? credential.access : undefined;
-    registerSkillTools(credentialBaseUrl);
-    await registerMcpTools(credentialBaseUrl, credentialAccess);
-    ctx.ui.notify(`Logged in to LiteLLM. Credentials saved to ${getAuthPath()}`, "info");
-  }
+  const isManaged = (provider: string | undefined): boolean => provider !== undefined && managed.has(provider);
 
   pi.on("input", async (event, ctx) => {
-    if (event.text.trim() !== `/login ${PROVIDER_NAME}`) return { action: "continue" };
-    if (!ctx.hasUI) return { action: "continue" };
-
-    try {
-      await runLogin(ctx);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (message !== "Login cancelled") ctx.ui.notify(`LiteLLM login failed: ${message}`, "error");
+    const text = event.text.trim();
+    for (const rt of managed.values()) {
+      if (!rt.runLogin || text !== `/login ${rt.name}`) continue;
+      if (!ctx.hasUI) return { action: "continue" };
+      try {
+        await rt.runLogin(ctx);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (message !== "Login cancelled") ctx.ui.notify(`LiteLLM login failed: ${message}`, "error");
+      }
+      return { action: "handled" };
     }
-
-    return { action: "handled" };
+    return { action: "continue" };
   });
 
   pi.registerCommand("litellm-refresh", {
-    description: "Re-discover models from the LiteLLM proxy.",
-    handler: async (_args, ctx) => {
+    description: "Re-discover models from LiteLLM proxies. Pass an instance name to refresh just one.",
+    handler: async (args, ctx) => {
       const disabledReason = discoveryDisabledReason();
       if (disabledReason) {
         ctx.ui.notify(`LiteLLM refresh disabled (${disabledReason})`, "warning");
         return;
       }
-      try {
-        const result = await runRefresh();
-        ctx.ui.notify(`LiteLLM: ${result.models.length} models refreshed (source: ${result.source})`, "info");
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        ctx.ui.notify(`LiteLLM refresh failed: ${message}`, "error");
+      const target = args.trim();
+      const runtimes = target
+        ? [managed.get(target)].filter((r): r is InstanceRuntime => r !== undefined)
+        : [...managed.values()];
+      if (target && runtimes.length === 0) {
+        ctx.ui.notify(
+          `LiteLLM: no managed instance named "${target}". Known: ${[...managed.keys()].join(", ")}`,
+          "warning",
+        );
+        return;
+      }
+      for (const rt of runtimes) {
+        const label = rt.isDefault ? "LiteLLM" : `LiteLLM[${rt.name}]`;
+        try {
+          const result = await rt.refresh();
+          ctx.ui.notify(`${label}: ${result.models.length} models refreshed (source: ${result.source})`, "info");
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          ctx.ui.notify(`${label} refresh failed: ${message}`, "error");
+        }
       }
     },
   });
 
-  let sessionId: string | undefined;
   pi.on("session_start", (_event, ctx) => {
     sessionId = getSessionIdFromFile(ctx.sessionManager.getSessionFile());
 
-    if (discoveryDisabledReason() || !cacheFetchedAt || Date.now() - cacheFetchedAt <= CACHE_STALE_MS) return;
-    void runRefresh().catch(() => undefined);
+    if (discoveryDisabledReason()) return;
+    const now = Date.now();
+    for (const rt of managed.values()) {
+      const fetchedAt = rt.getCacheFetchedAt();
+      if (!fetchedAt || now - fetchedAt <= CACHE_STALE_MS) continue;
+      void rt.refresh().catch(() => undefined);
+    }
   });
 
   pi.on("before_provider_request", (event, ctx) => {
-    if (ctx.model?.provider !== PROVIDER_NAME) return;
+    if (!isManaged(ctx.model?.provider)) return;
     if (typeof event.payload !== "object" || event.payload === null) return;
     return prepareLiteLLMRequestPayload(
       event.payload as Record<string, unknown>,
@@ -937,6 +1016,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
   pi.on("before_agent_start", async (event) => {
     if (discoveryDisabledReason()) return;
+    // Skills are a default-proxy feature; inject only from the default instance.
     const fresh = await resolveCredentials();
     if (!fresh.baseUrl || !fresh.apiKey) return;
     const skills = await listSkills(fresh.baseUrl, fresh.apiKey);
@@ -947,7 +1027,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
   pi.on("message_end", (event) => {
     if (event.message.role !== "assistant") return;
-    const message = normalizeThinkTags(event.message as AssistantMessage);
+    const message = normalizeThinkTags(event.message as AssistantMessage, (p) => managed.has(p));
     if (!message) return;
     return { message };
   });
